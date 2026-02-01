@@ -1,3 +1,4 @@
+mod server;
 mod signal;
 mod storage;
 
@@ -82,7 +83,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Server => {
             println!("Starting server...");
-            // TODO: implement
+            let server = server::Server::new(&config_dir).await?;
+            server.run().await?;
         }
         Commands::Link { name } => {
             println!("Linking device as '{}'...", name);
