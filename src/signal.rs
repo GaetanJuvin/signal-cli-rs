@@ -187,44 +187,25 @@ pub async fn send_message(
     Ok(timestamp)
 }
 
-/// Start receiving messages and send events through a channel.
+/// Start receiving messages - returns the message stream.
 ///
-/// This function will:
-/// 1. Connect to the Signal websocket
-/// 2. Receive messages continuously
-/// 3. Parse incoming messages and send SignalEvents through the channel
-///
-/// The function runs until the channel is closed or an error occurs.
-///
-/// # Arguments
-///
-/// * `manager` - The registered Signal manager
-/// * `tx` - Channel sender for SignalEvents
-pub async fn receive_messages(manager: &mut SignalManager, tx: mpsc::Sender<SignalEvent>) {
-    let messages = match manager.receive_messages().await {
-        Ok(stream) => stream,
-        Err(e) => {
-            tracing::error!("Failed to start receiving messages: {}", e);
-            return;
-        }
-    };
+/// The caller should poll this stream in their event loop.
+pub async fn start_receiving(
+    manager: &mut SignalManager,
+) -> Result<impl futures::Stream<Item = SignalEvent> + '_> {
+    let messages = manager
+        .receive_messages()
+        .await
+        .map_err(|e| anyhow!("Failed to start receiving messages: {}", e))?;
 
-    futures::pin_mut!(messages);
-
-    while let Some(received) = messages.next().await {
+    Ok(messages.filter_map(|received| {
         let event = match received {
             Received::QueueEmpty => Some(SignalEvent::QueueEmpty),
             Received::Contacts => Some(SignalEvent::ContactsSync),
             Received::Content(content) => content_to_event(&content),
         };
-
-        if let Some(event) = event {
-            if tx.send(event).await.is_err() {
-                tracing::debug!("Channel closed, stopping message receiver");
-                break;
-            }
-        }
-    }
+        future::ready(event)
+    }))
 }
 
 /// Convert a Content message to a SignalEvent if it contains a text message.

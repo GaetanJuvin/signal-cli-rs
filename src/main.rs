@@ -85,24 +85,46 @@ fn print_qr(url: Url) {
     println!("\nOr use this URL: {}\n", url);
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::WARN.into()),
-        )
-        .init();
-
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_dir = expand_path(&cli.config);
     std::fs::create_dir_all(&config_dir)?;
 
+    // Handle daemon mode specially - must fork BEFORE creating tokio runtime
+    if let Commands::Server { daemon: true, .. } = &cli.command {
+        server::daemonize(&config_dir)?;
+    }
+
+    // Handle sync commands that don't need tokio
+    match &cli.command {
+        Commands::Stop => {
+            return server::stop_daemon(&config_dir);
+        }
+        Commands::Groups => {
+            println!("Groups not yet implemented.");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Now create tokio runtime and run async commands
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async_main(cli, config_dir))
+}
+
+async fn async_main(cli: Cli, config_dir: PathBuf) -> Result<()> {
+    // Init tracing after daemonize (so logs go to file in daemon mode)
+    if !matches!(cli.command, Commands::Server { daemon: true, .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::WARN.into()),
+            )
+            .init();
+    }
+
     match cli.command {
         Commands::Server { stdio, daemon } => {
-            if daemon {
-                server::daemonize(&config_dir)?;
-            }
             let server = server::Server::new(&config_dir).await?;
             if stdio {
                 server.run_stdio().await?;
@@ -113,8 +135,9 @@ async fn main() -> Result<()> {
                 server.run().await?;
             }
         }
-        Commands::Stop => {
-            server::stop_daemon(&config_dir)?;
+        Commands::Stop | Commands::Groups => {
+            // Handled above in sync section
+            unreachable!()
         }
         Commands::Link { name } => {
             println!("Linking device as '{}'...", name);
@@ -133,9 +156,6 @@ async fn main() -> Result<()> {
         Commands::Contacts { filter } => {
             let client = crate::client::Client::new(&config_dir);
             client.list_contacts(filter.as_deref()).await?;
-        }
-        Commands::Groups => {
-            println!("Groups not yet implemented.");
         }
     }
 

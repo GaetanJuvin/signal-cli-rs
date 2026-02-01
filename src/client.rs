@@ -77,8 +77,14 @@ impl Client {
     pub async fn status(&self) -> Result<()> {
         let result = self.call("get_status", serde_json::json!({})).await?;
 
-        println!("Connected as {}", result["account"]);
-        println!("Contacts: {}", result["contacts_count"]);
+        let account = result["account_uuid"].as_str().unwrap_or("unknown");
+        let connected = result["connected"].as_bool().unwrap_or(false);
+
+        if connected {
+            println!("Connected as {}", account);
+        } else {
+            println!("Not connected (account: {})", account);
+        }
         Ok(())
     }
 

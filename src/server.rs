@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use daemonize::Daemonize;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -278,19 +279,13 @@ impl Server {
         tracing::info!("Server listening on {:?}", self.socket_path);
         tracing::info!("Connected as {}", self.account_uuid);
 
-        // Channel for Signal events (from receiver to main loop)
-        let (event_tx, mut event_rx) = mpsc::channel::<SignalEvent>(100);
-
         // Channel for manager commands (from clients to main loop)
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ManagerCommand>(100);
-
-        // Start receiving messages
-        signal::receive_messages(&mut self.manager, event_tx).await;
 
         // Set up SIGTERM handler for graceful shutdown
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-        // Main event loop - handles everything on one task to avoid Send issues
+        // Main event loop
         loop {
             tokio::select! {
                 // Handle SIGTERM (graceful shutdown)
@@ -318,13 +313,6 @@ impl Server {
                         Err(e) => {
                             tracing::error!("Accept error: {}", e);
                         }
-                    }
-                }
-
-                // Handle Signal events
-                Some(event) = event_rx.recv() => {
-                    if let Err(e) = self.handle_signal_event(event).await {
-                        tracing::error!("Error handling signal event: {}", e);
                     }
                 }
 
@@ -358,14 +346,8 @@ impl Server {
         let mut stdin_reader = BufReader::new(stdin());
         let mut line = String::new();
 
-        // Channel for Signal events (from receiver to main loop)
-        let (event_tx, mut event_rx) = mpsc::channel::<SignalEvent>(100);
-
         // Channel for manager commands (from request handler to main loop)
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ManagerCommand>(100);
-
-        // Start receiving messages
-        signal::receive_messages(&mut self.manager, event_tx).await;
 
         loop {
             tokio::select! {
@@ -411,13 +393,6 @@ impl Server {
                             tracing::error!("Error reading stdin: {}", e);
                             break;
                         }
-                    }
-                }
-
-                // Handle Signal events
-                Some(event) = event_rx.recv() => {
-                    if let Err(e) = self.handle_signal_event(event).await {
-                        tracing::error!("Error handling signal event: {}", e);
                     }
                 }
 
