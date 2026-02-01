@@ -1,3 +1,4 @@
+mod signal;
 mod storage;
 
 use clap::{Parser, Subcommand};
