@@ -1,3 +1,4 @@
+mod client;
 mod server;
 mod signal;
 mod storage;
@@ -93,12 +94,12 @@ async fn main() -> Result<()> {
             println!("Successfully linked!");
         }
         Commands::Send { recipient, message } => {
-            println!("Sending to {}: {}", recipient, message);
-            // TODO: send via server
+            let client = crate::client::Client::new(&config_dir);
+            client.send_message(&recipient, &message).await?;
         }
         Commands::Status => {
-            println!("Checking status...");
-            // TODO: check server status
+            let client = crate::client::Client::new(&config_dir);
+            client.status().await?;
         }
     }
 
