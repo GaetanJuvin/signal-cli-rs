@@ -81,4 +81,28 @@ impl Client {
         println!("Contacts: {}", result["contacts_count"]);
         Ok(())
     }
+
+    pub async fn list_contacts(&self, filter: Option<&str>) -> Result<()> {
+        let result = self.call("list_contacts", serde_json::json!({
+            "filter": filter
+        })).await?;
+
+        // Pretty print contacts
+        if let Some(contacts) = result.as_array() {
+            if contacts.is_empty() {
+                println!("No contacts found.");
+            } else {
+                println!("{:<20} {:<15} {}", "NAME", "PHONE", "UUID");
+                println!("{}", "-".repeat(70));
+                for contact in contacts {
+                    let name = contact["name"].as_str().unwrap_or("-");
+                    let phone = contact["phone"].as_str().unwrap_or("-");
+                    let uuid = contact["uuid"].as_str().unwrap_or("-");
+                    println!("{:<20} {:<15} {}", name, phone, uuid);
+                }
+                println!("\nTotal: {} contact(s)", contacts.len());
+            }
+        }
+        Ok(())
+    }
 }

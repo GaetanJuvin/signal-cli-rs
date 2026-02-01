@@ -27,7 +27,12 @@ enum Commands {
         /// Use stdio instead of Unix socket (for MCP clients)
         #[arg(long)]
         stdio: bool,
+        /// Run as a background daemon
+        #[arg(long)]
+        daemon: bool,
     },
+    /// Stop the daemon (if running)
+    Stop,
     /// Link this device to your Signal account
     Link {
         /// Device name shown in Signal
@@ -43,6 +48,14 @@ enum Commands {
     },
     /// Check server status
     Status,
+    /// List contacts
+    Contacts {
+        /// Filter by name or phone
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
+    /// List groups
+    Groups,
 }
 
 /// Expand ~ to home directory in paths.
@@ -86,14 +99,22 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&config_dir)?;
 
     match cli.command {
-        Commands::Server { stdio } => {
+        Commands::Server { stdio, daemon } => {
+            if daemon {
+                server::daemonize(&config_dir)?;
+            }
             let server = server::Server::new(&config_dir).await?;
             if stdio {
                 server.run_stdio().await?;
             } else {
-                println!("Starting server...");
+                if !daemon {
+                    println!("Starting server...");
+                }
                 server.run().await?;
             }
+        }
+        Commands::Stop => {
+            server::stop_daemon(&config_dir)?;
         }
         Commands::Link { name } => {
             println!("Linking device as '{}'...", name);
@@ -108,6 +129,13 @@ async fn main() -> Result<()> {
         Commands::Status => {
             let client = crate::client::Client::new(&config_dir);
             client.status().await?;
+        }
+        Commands::Contacts { filter } => {
+            let client = crate::client::Client::new(&config_dir);
+            client.list_contacts(filter.as_deref()).await?;
+        }
+        Commands::Groups => {
+            println!("Groups not yet implemented.");
         }
     }
 

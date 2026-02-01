@@ -5,8 +5,10 @@
 //! storing them in the database. Clients connect via Unix socket and send JSON-RPC
 //! requests to interact with Signal.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use daemonize::Daemonize;
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -15,6 +17,137 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::signal::{self, SignalEvent, SignalManager};
 use crate::storage::{Contact, Message, Storage};
+
+/// Global variable to hold the logging guard (keeps logging active)
+static LOGGING_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+    std::sync::OnceLock::new();
+
+/// Daemonize the current process.
+///
+/// This function:
+/// 1. Sets up file logging to `{config_dir}/signal-mcp.log`
+/// 2. Writes a PID file to `{config_dir}/signal-mcp.pid`
+/// 3. Forks to background and detaches from terminal
+/// 4. Sets up SIGTERM handler for graceful shutdown
+pub fn daemonize(config_dir: &Path) -> Result<()> {
+    let pid_file = config_dir.join("signal-mcp.pid");
+    let log_file = config_dir.join("signal-mcp.log");
+
+    // Check if daemon is already running
+    if pid_file.exists() {
+        if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                // Check if process is still running
+                if unsafe { libc::kill(pid, 0) } == 0 {
+                    anyhow::bail!(
+                        "Daemon already running with PID {}. Use 'signal-mcp stop' to stop it.",
+                        pid
+                    );
+                }
+            }
+        }
+        // Stale PID file, remove it
+        let _ = fs::remove_file(&pid_file);
+    }
+
+    // Open log file for appending
+    let log_file_handle = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+        .with_context(|| format!("Failed to open log file: {:?}", log_file))?;
+
+    let stdout = log_file_handle.try_clone()?;
+    let stderr = log_file_handle;
+
+    let daemon = Daemonize::new()
+        .pid_file(&pid_file)
+        .chown_pid_file(true)
+        .working_directory(config_dir)
+        .stdout(stdout)
+        .stderr(stderr);
+
+    daemon.start().with_context(|| "Failed to daemonize")?;
+
+    // Set up file-based logging after daemonization
+    setup_daemon_logging(config_dir);
+
+    Ok(())
+}
+
+/// Set up logging to a file for daemon mode.
+fn setup_daemon_logging(config_dir: &Path) {
+    let log_file = config_dir.join("signal-mcp.log");
+
+    let file_appender = tracing_appender::rolling::never(config_dir, "signal-mcp.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    // Store the guard in a global to keep it alive for the duration of the process
+    let _ = LOGGING_GUARD.set(guard);
+
+    // Note: We need to set a new subscriber since the default one was already set in main
+    // Use try_init to avoid panic if already set
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .with_ansi(false)
+        .finish();
+
+    // Set as the global default (this will replace the previous one)
+    let _ = tracing::subscriber::set_global_default(subscriber);
+
+    tracing::info!("Daemon started, logging to {:?}", log_file);
+}
+
+/// Stop a running daemon.
+///
+/// Reads the PID file and sends SIGTERM to the daemon process.
+pub fn stop_daemon(config_dir: &Path) -> Result<()> {
+    let pid_file = config_dir.join("signal-mcp.pid");
+
+    if !pid_file.exists() {
+        println!("No daemon running (PID file not found)");
+        return Ok(());
+    }
+
+    let pid_str = fs::read_to_string(&pid_file)
+        .with_context(|| format!("Failed to read PID file: {:?}", pid_file))?;
+
+    let pid: i32 = pid_str
+        .trim()
+        .parse()
+        .with_context(|| format!("Invalid PID in file: {}", pid_str))?;
+
+    // Check if process is running
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        println!("Daemon not running (stale PID file), cleaning up");
+        let _ = fs::remove_file(&pid_file);
+        return Ok(());
+    }
+
+    // Send SIGTERM
+    println!("Sending SIGTERM to daemon (PID {})", pid);
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        anyhow::bail!("Failed to send SIGTERM to PID {}", pid);
+    }
+
+    // Wait for process to terminate (with timeout)
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            println!("Daemon stopped");
+            let _ = fs::remove_file(&pid_file);
+            return Ok(());
+        }
+    }
+
+    println!("Daemon did not stop within 5 seconds, you may need to kill it manually");
+    Ok(()
+    )
+}
 
 /// JSON-RPC request structure.
 #[derive(Debug, Deserialize)]
@@ -139,10 +272,11 @@ impl Server {
     /// 1. Listen on the Unix socket for client connections
     /// 2. Spawn a background task to receive Signal messages
     /// 3. Handle both client requests and Signal events concurrently
+    /// 4. Handle SIGTERM for graceful shutdown (daemon mode)
     pub async fn run(mut self) -> Result<()> {
         let listener = UnixListener::bind(&self.socket_path)?;
-        println!("Server listening on {:?}", self.socket_path);
-        println!("Connected as {}", self.account_uuid);
+        tracing::info!("Server listening on {:?}", self.socket_path);
+        tracing::info!("Connected as {}", self.account_uuid);
 
         // Channel for Signal events (from receiver to main loop)
         let (event_tx, mut event_rx) = mpsc::channel::<SignalEvent>(100);
@@ -153,9 +287,18 @@ impl Server {
         // Start receiving messages
         signal::receive_messages(&mut self.manager, event_tx).await;
 
+        // Set up SIGTERM handler for graceful shutdown
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
         // Main event loop - handles everything on one task to avoid Send issues
         loop {
             tokio::select! {
+                // Handle SIGTERM (graceful shutdown)
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM, shutting down gracefully...");
+                    break;
+                }
+
                 // Handle incoming client connections
                 result = listener.accept() => {
                     match result {
@@ -196,6 +339,11 @@ impl Server {
                 }
             }
         }
+
+        // Clean up socket file on shutdown
+        let _ = std::fs::remove_file(&self.socket_path);
+        tracing::info!("Server shutdown complete");
+        Ok(())
     }
 
     /// Run the server in stdio mode for MCP clients.
