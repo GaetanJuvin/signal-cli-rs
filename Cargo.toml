@@ -33,6 +33,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "1"
 
+# Directory paths
+dirs = "5"
+
 # URL handling
 url = "2"
 

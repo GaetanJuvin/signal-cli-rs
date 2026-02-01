@@ -54,7 +54,8 @@ pub enum SignalEvent {
 /// Creates the database if it does not exist.
 pub async fn open_store(store_path: &Path) -> Result<SqliteStore> {
     let db_path = store_path.to_string_lossy();
-    SqliteStore::open(&db_path, OnNewIdentity::Trust)
+    // Use open_with_passphrase with None to get create_if_missing(true) behavior
+    SqliteStore::open_with_passphrase(&db_path, None, OnNewIdentity::Trust)
         .await
         .with_context(|| format!("Failed to open store at {}", db_path))
 }
