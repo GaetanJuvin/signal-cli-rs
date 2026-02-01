@@ -23,7 +23,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the MCP server
-    Server,
+    Server {
+        /// Use stdio instead of Unix socket (for MCP clients)
+        #[arg(long)]
+        stdio: bool,
+    },
     /// Link this device to your Signal account
     Link {
         /// Device name shown in Signal
@@ -82,10 +86,14 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&config_dir)?;
 
     match cli.command {
-        Commands::Server => {
-            println!("Starting server...");
+        Commands::Server { stdio } => {
             let server = server::Server::new(&config_dir).await?;
-            server.run().await?;
+            if stdio {
+                server.run_stdio().await?;
+            } else {
+                println!("Starting server...");
+                server.run().await?;
+            }
         }
         Commands::Link { name } => {
             println!("Linking device as '{}'...", name);

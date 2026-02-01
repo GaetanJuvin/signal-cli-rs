@@ -198,6 +198,105 @@ impl Server {
         }
     }
 
+    /// Run the server in stdio mode for MCP clients.
+    ///
+    /// This reads JSON-RPC requests from stdin and writes responses to stdout,
+    /// instead of using a Unix socket. This is the standard transport for MCP
+    /// (Model Context Protocol) clients like Claude.
+    pub async fn run_stdio(mut self) -> Result<()> {
+        use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let mut stdout = stdout();
+        let mut stdin_reader = BufReader::new(stdin());
+        let mut line = String::new();
+
+        // Channel for Signal events (from receiver to main loop)
+        let (event_tx, mut event_rx) = mpsc::channel::<SignalEvent>(100);
+
+        // Channel for manager commands (from request handler to main loop)
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ManagerCommand>(100);
+
+        // Start receiving messages
+        signal::receive_messages(&mut self.manager, event_tx).await;
+
+        loop {
+            tokio::select! {
+                // Handle stdin input
+                result = stdin_reader.read_line(&mut line) => {
+                    match result {
+                        Ok(0) => {
+                            // EOF - stdin closed
+                            break;
+                        }
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+                                    Ok(request) => {
+                                        // Handle send_message specially since it needs the manager
+                                        if request.method == "send_message" {
+                                            self.handle_send_message_request(request, &cmd_tx).await
+                                        } else {
+                                            handle_request(
+                                                request,
+                                                &self.storage,
+                                                &cmd_tx,
+                                                &self.account_uuid,
+                                            ).await
+                                        }
+                                    }
+                                    Err(e) => JsonRpcResponse::error(
+                                        None,
+                                        -32700,
+                                        format!("Parse error: {}", e),
+                                    ),
+                                };
+
+                                let response_json = serde_json::to_string(&response)?;
+                                stdout.write_all(response_json.as_bytes()).await?;
+                                stdout.write_all(b"\n").await?;
+                                stdout.flush().await?;
+                            }
+                            line.clear();
+                        }
+                        Err(e) => {
+                            tracing::error!("Error reading stdin: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Handle Signal events
+                Some(event) = event_rx.recv() => {
+                    if let Err(e) = self.handle_signal_event(event).await {
+                        tracing::error!("Error handling signal event: {}", e);
+                    }
+                }
+
+                // Handle manager commands
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        ManagerCommand::SendMessage { recipient_uuid, message, reply } => {
+                            let result = signal::send_message(&mut self.manager, &recipient_uuid, &message).await;
+                            let _ = reply.send(result.map_err(|e| e.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle a send_message request directly (for stdio mode).
+    async fn handle_send_message_request(
+        &self,
+        request: JsonRpcRequest,
+        cmd_tx: &mpsc::Sender<ManagerCommand>,
+    ) -> JsonRpcResponse {
+        handle_request(request, &self.storage, cmd_tx, &self.account_uuid).await
+    }
+
     /// Handle Signal events by storing them in the database.
     async fn handle_signal_event(&self, event: SignalEvent) -> Result<()> {
         match event {
