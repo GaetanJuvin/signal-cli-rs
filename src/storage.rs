@@ -19,6 +19,14 @@ pub struct Message {
     pub timestamp: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct Conversation {
+    pub contact: Contact,
+    pub last_message: String,
+    pub last_timestamp: i64,
+    pub unread_count: i64,
+}
+
 pub struct Storage {
     conn: Connection,
 }
@@ -163,5 +171,35 @@ impl Storage {
         }
 
         Ok(None)
+    }
+
+    pub fn get_conversations(&self, limit: i64) -> Result<Vec<Conversation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.uuid, c.phone, c.name, m.body, m.timestamp,
+                    (SELECT COUNT(*) FROM messages m2
+                     WHERE m2.contact_uuid = c.uuid AND m2.direction = 'in')
+             FROM contacts c
+             JOIN messages m ON m.contact_uuid = c.uuid
+             WHERE m.timestamp = (
+                 SELECT MAX(timestamp) FROM messages WHERE contact_uuid = c.uuid
+             )
+             ORDER BY m.timestamp DESC
+             LIMIT ?1"
+        )?;
+
+        let rows = stmt.query_map([limit], |row| {
+            Ok(Conversation {
+                contact: Contact {
+                    uuid: row.get(0)?,
+                    phone: row.get(1)?,
+                    name: row.get(2)?,
+                },
+                last_message: row.get(3)?,
+                last_timestamp: row.get(4)?,
+                unread_count: row.get(5)?,
+            })
+        })?;
+
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }

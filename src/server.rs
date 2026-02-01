@@ -402,7 +402,10 @@ async fn handle_request(
         "send_message" => rpc_send_message(request.id, request.params, storage, cmd_tx).await,
         "list_contacts" => rpc_list_contacts(request.id, request.params, storage).await,
         "get_messages" => rpc_get_messages(request.id, request.params, storage).await,
+        "get_conversations" => rpc_get_conversations(request.id, request.params, storage).await,
         "get_status" => rpc_get_status(request.id, account_uuid),
+        "tools/list" => rpc_tools_list(request.id),
+        "tools/call" => rpc_tools_call(request.id, request.params, storage, cmd_tx, account_uuid).await,
         _ => JsonRpcResponse::error(
             request.id,
             -32601,
@@ -562,6 +565,209 @@ fn rpc_get_status(id: Option<serde_json::Value>, account_uuid: &str) -> JsonRpcR
     };
 
     JsonRpcResponse::success(id, serde_json::to_value(status).unwrap())
+}
+
+/// RPC: get_conversations - List recent conversations.
+async fn rpc_get_conversations(
+    id: Option<serde_json::Value>,
+    params: Option<serde_json::Value>,
+    storage: &Arc<Mutex<Storage>>,
+) -> JsonRpcResponse {
+    #[derive(Deserialize, Default)]
+    struct Params {
+        #[serde(default = "default_conv_limit")]
+        limit: i64,
+    }
+    fn default_conv_limit() -> i64 { 20 }
+
+    let params: Params = params
+        .map(serde_json::from_value)
+        .transpose()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    let storage = storage.lock().await;
+    match storage.get_conversations(params.limit) {
+        Ok(conversations) => JsonRpcResponse::success(id, serde_json::to_value(conversations).unwrap()),
+        Err(e) => JsonRpcResponse::error(id, -32000, format!("Failed to get conversations: {}", e)),
+    }
+}
+
+/// RPC: tools/list - List available MCP tools.
+fn rpc_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
+    let tools = serde_json::json!({
+        "tools": [
+            {
+                "name": "send_message",
+                "description": "Send a Signal message to a contact",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "recipient": {
+                            "type": "string",
+                            "description": "Phone number (+1234...), contact name, or UUID"
+                        },
+                        "message": {
+                            "type": "string",
+                            "description": "Message text to send"
+                        }
+                    },
+                    "required": ["recipient", "message"]
+                }
+            },
+            {
+                "name": "list_contacts",
+                "description": "List Signal contacts",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "filter": {
+                            "type": "string",
+                            "description": "Optional search filter for name or phone"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "get_messages",
+                "description": "Get message history with a contact",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "contact": {
+                            "type": "string",
+                            "description": "Phone number, contact name, or UUID"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max messages to return (default 50)"
+                        }
+                    },
+                    "required": ["contact"]
+                }
+            },
+            {
+                "name": "get_conversations",
+                "description": "List recent conversations",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max conversations to return (default 20)"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "get_status",
+                "description": "Get server connection status",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        ]
+    });
+
+    JsonRpcResponse::success(id, tools)
+}
+
+/// RPC: tools/call - Invoke an MCP tool.
+async fn rpc_tools_call(
+    id: Option<serde_json::Value>,
+    params: Option<serde_json::Value>,
+    storage: &Arc<Mutex<Storage>>,
+    cmd_tx: &mpsc::Sender<ManagerCommand>,
+    account_uuid: &str,
+) -> JsonRpcResponse {
+    #[derive(Deserialize)]
+    struct Params {
+        name: String,
+        arguments: Option<serde_json::Value>,
+    }
+
+    let params: Params = match params {
+        Some(p) => match serde_json::from_value(p) {
+            Ok(params) => params,
+            Err(e) => {
+                return JsonRpcResponse::error(id, -32602, format!("Invalid params: {}", e))
+            }
+        },
+        None => return JsonRpcResponse::error(id, -32602, "Missing params".to_string()),
+    };
+
+    let arguments = params.arguments.unwrap_or(serde_json::json!({}));
+
+    let result = match params.name.as_str() {
+        "send_message" => {
+            let response = rpc_send_message(None, Some(arguments), storage, cmd_tx).await;
+            match response.result {
+                Some(r) => r,
+                None => return JsonRpcResponse::error(
+                    id,
+                    -32000,
+                    response.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".to_string()),
+                ),
+            }
+        }
+        "list_contacts" => {
+            let response = rpc_list_contacts(None, Some(arguments), storage).await;
+            match response.result {
+                Some(r) => r,
+                None => return JsonRpcResponse::error(
+                    id,
+                    -32000,
+                    response.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".to_string()),
+                ),
+            }
+        }
+        "get_messages" => {
+            let response = rpc_get_messages(None, Some(arguments), storage).await;
+            match response.result {
+                Some(r) => r,
+                None => return JsonRpcResponse::error(
+                    id,
+                    -32000,
+                    response.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".to_string()),
+                ),
+            }
+        }
+        "get_conversations" => {
+            let response = rpc_get_conversations(None, Some(arguments), storage).await;
+            match response.result {
+                Some(r) => r,
+                None => return JsonRpcResponse::error(
+                    id,
+                    -32000,
+                    response.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".to_string()),
+                ),
+            }
+        }
+        "get_status" => {
+            let response = rpc_get_status(None, account_uuid);
+            match response.result {
+                Some(r) => r,
+                None => return JsonRpcResponse::error(
+                    id,
+                    -32000,
+                    response.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".to_string()),
+                ),
+            }
+        }
+        _ => return JsonRpcResponse::error(id, -32000, format!("Unknown tool: {}", params.name)),
+    };
+
+    // MCP tools/call returns content array
+    let content = serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+        }]
+    });
+
+    JsonRpcResponse::success(id, content)
 }
 
 #[cfg(test)]
