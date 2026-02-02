@@ -17,7 +17,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::signal::{self, SignalEvent, SignalManager};
-use crate::storage::{Contact, Message, Storage};
+use crate::storage::{Contact, Group, Message, Storage};
 
 /// Global variable to hold the logging guard (keeps logging active)
 static LOGGING_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
@@ -224,12 +224,21 @@ struct GetMessagesParams {
     limit: Option<i64>,
 }
 
+/// Parameters for list_groups RPC.
+#[derive(Debug, Deserialize)]
+struct ListGroupsParams {
+    filter: Option<String>,
+}
+
 /// Command sent to the Signal manager task.
 enum ManagerCommand {
     SendMessage {
         recipient_uuid: String,
         message: String,
         reply: oneshot::Sender<Result<u64, String>>,
+    },
+    SyncContacts {
+        reply: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -323,6 +332,10 @@ impl Server {
                             let result = signal::send_message(&mut self.manager, &recipient_uuid, &message).await;
                             let _ = reply.send(result.map_err(|e| e.to_string()));
                         }
+                        ManagerCommand::SyncContacts { reply } => {
+                            let result = signal::request_contacts_sync(&mut self.manager).await;
+                            let _ = reply.send(result.map_err(|e| e.to_string()));
+                        }
                     }
                 }
             }
@@ -401,6 +414,10 @@ impl Server {
                     match cmd {
                         ManagerCommand::SendMessage { recipient_uuid, message, reply } => {
                             let result = signal::send_message(&mut self.manager, &recipient_uuid, &message).await;
+                            let _ = reply.send(result.map_err(|e| e.to_string()));
+                        }
+                        ManagerCommand::SyncContacts { reply } => {
+                            let result = signal::request_contacts_sync(&mut self.manager).await;
                             let _ = reply.send(result.map_err(|e| e.to_string()));
                         }
                     }
@@ -524,6 +541,8 @@ async fn handle_request(
     match request.method.as_str() {
         "send_message" => rpc_send_message(request.id, request.params, storage, cmd_tx).await,
         "list_contacts" => rpc_list_contacts(request.id, request.params, storage).await,
+        "list_groups" => rpc_list_groups(request.id, request.params, storage).await,
+        "sync_contacts" => rpc_sync_contacts(request.id, cmd_tx).await,
         "get_messages" => rpc_get_messages(request.id, request.params, storage).await,
         "get_conversations" => rpc_get_conversations(request.id, request.params, storage).await,
         "get_status" => rpc_get_status(request.id, account_uuid),
@@ -636,6 +655,52 @@ async fn rpc_list_contacts(
     match storage.list_contacts(filter.as_deref()) {
         Ok(contacts) => JsonRpcResponse::success(id, serde_json::to_value(contacts).unwrap()),
         Err(e) => JsonRpcResponse::error(id, -32000, format!("Failed to list contacts: {}", e)),
+    }
+}
+
+/// RPC: list_groups - List groups from storage.
+async fn rpc_list_groups(
+    id: Option<serde_json::Value>,
+    params: Option<serde_json::Value>,
+    storage: &Arc<Mutex<Storage>>,
+) -> JsonRpcResponse {
+    let filter = params
+        .and_then(|p| serde_json::from_value::<ListGroupsParams>(p).ok())
+        .and_then(|p| p.filter);
+
+    let storage = storage.lock().await;
+    match storage.list_groups(filter.as_deref()) {
+        Ok(groups) => JsonRpcResponse::success(id, serde_json::to_value(groups).unwrap()),
+        Err(e) => JsonRpcResponse::error(id, -32000, format!("Failed to list groups: {}", e)),
+    }
+}
+
+/// RPC: sync_contacts - Request contacts sync from primary device.
+async fn rpc_sync_contacts(
+    id: Option<serde_json::Value>,
+    cmd_tx: &mpsc::Sender<ManagerCommand>,
+) -> JsonRpcResponse {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let cmd = ManagerCommand::SyncContacts { reply: reply_tx };
+
+    if cmd_tx.send(cmd).await.is_err() {
+        return JsonRpcResponse::error(id, -32000, "Server shutting down".to_string());
+    }
+
+    match reply_rx.await {
+        Ok(Ok(())) => JsonRpcResponse::success(
+            id,
+            serde_json::json!({
+                "success": true,
+                "message": "Sync requested. Contacts will be updated."
+            }),
+        ),
+        Ok(Err(e)) => {
+            JsonRpcResponse::error(id, -32000, format!("Failed to request contacts sync: {}", e))
+        }
+        Err(_) => {
+            JsonRpcResponse::error(id, -32000, "Server error: channel closed".to_string())
+        }
     }
 }
 
@@ -790,6 +855,27 @@ fn rpc_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                     "type": "object",
                     "properties": {}
                 }
+            },
+            {
+                "name": "sync_contacts",
+                "description": "Request contacts sync from the primary device",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "list_groups",
+                "description": "List Signal groups",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "filter": {
+                            "type": "string",
+                            "description": "Optional search filter for group name"
+                        }
+                    }
+                }
             }
         ]
     });
@@ -870,6 +956,28 @@ async fn rpc_tools_call(
         }
         "get_status" => {
             let response = rpc_get_status(None, account_uuid);
+            match response.result {
+                Some(r) => r,
+                None => return JsonRpcResponse::error(
+                    id,
+                    -32000,
+                    response.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".to_string()),
+                ),
+            }
+        }
+        "sync_contacts" => {
+            let response = rpc_sync_contacts(None, cmd_tx).await;
+            match response.result {
+                Some(r) => r,
+                None => return JsonRpcResponse::error(
+                    id,
+                    -32000,
+                    response.error.map(|e| e.message).unwrap_or_else(|| "Unknown error".to_string()),
+                ),
+            }
+        }
+        "list_groups" => {
+            let response = rpc_list_groups(None, Some(arguments), storage).await;
             match response.result {
                 Some(r) => r,
                 None => return JsonRpcResponse::error(

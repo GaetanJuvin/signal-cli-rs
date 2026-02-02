@@ -111,4 +111,39 @@ impl Client {
         }
         Ok(())
     }
+
+    pub async fn list_groups(&self, filter: Option<&str>) -> Result<()> {
+        let result = self.call("list_groups", serde_json::json!({
+            "filter": filter
+        })).await?;
+
+        // Pretty print groups
+        if let Some(groups) = result.as_array() {
+            if groups.is_empty() {
+                println!("No groups found.");
+            } else {
+                println!("{:<30} {:<10} {}", "NAME", "MEMBERS", "ID");
+                println!("{}", "-".repeat(70));
+                for group in groups {
+                    let name = group["name"].as_str().unwrap_or("-");
+                    let members = group["members_count"].as_u64().unwrap_or(0);
+                    let id = group["id"].as_str().unwrap_or("-");
+                    println!("{:<30} {:<10} {}", name, members, id);
+                }
+                println!("\nTotal: {} group(s)", groups.len());
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn sync_contacts(&self) -> Result<()> {
+        let result = self.call("sync_contacts", serde_json::json!({})).await?;
+
+        if let Some(message) = result["message"].as_str() {
+            println!("{}", message);
+        } else {
+            println!("Sync requested. Contacts will be updated.");
+        }
+        Ok(())
+    }
 }

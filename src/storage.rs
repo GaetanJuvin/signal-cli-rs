@@ -19,6 +19,13 @@ pub struct Message {
     pub timestamp: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub id: String,  // base64 encoded group ID
+    pub name: Option<String>,
+    pub members_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Conversation {
     pub contact: Contact,
@@ -66,6 +73,16 @@ impl Storage {
                 ON contacts(phone);
             CREATE INDEX IF NOT EXISTS idx_contacts_name
                 ON contacts(name);
+
+            CREATE TABLE IF NOT EXISTS groups (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                members_count INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_groups_name
+                ON groups(name);
             "
         )?;
         Ok(())
@@ -171,6 +188,50 @@ impl Storage {
         }
 
         Ok(None)
+    }
+
+    pub fn upsert_group(&self, group: &Group) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO groups (id, name, members_count, updated_at)
+             VALUES (?1, ?2, ?3, strftime('%s', 'now'))
+             ON CONFLICT(id) DO UPDATE SET
+                name = COALESCE(?2, name),
+                members_count = ?3,
+                updated_at = strftime('%s', 'now')",
+            params![group.id, group.name, group.members_count as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_groups(&self, filter: Option<&str>) -> Result<Vec<Group>> {
+        if let Some(f) = filter {
+            let pattern = format!("%{}%", f);
+            let mut stmt = self.conn.prepare(
+                "SELECT id, name, members_count FROM groups
+                 WHERE name LIKE ?1
+                 ORDER BY name"
+            )?;
+            let rows = stmt.query_map([&pattern], |row| {
+                Ok(Group {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    members_count: row.get::<_, i64>(2)? as usize,
+                })
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, name, members_count FROM groups ORDER BY name"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(Group {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    members_count: row.get::<_, i64>(2)? as usize,
+                })
+            })?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        }
     }
 
     pub fn get_conversations(&self, limit: i64) -> Result<Vec<Conversation>> {

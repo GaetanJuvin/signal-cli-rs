@@ -55,7 +55,13 @@ enum Commands {
         filter: Option<String>,
     },
     /// List groups
-    Groups,
+    Groups {
+        /// Filter by name
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
+    /// Sync contacts from primary device
+    Sync,
 }
 
 /// Expand ~ to home directory in paths.
@@ -100,10 +106,6 @@ fn main() -> Result<()> {
         Commands::Stop => {
             return server::stop_daemon(&config_dir);
         }
-        Commands::Groups => {
-            println!("Groups not yet implemented.");
-            return Ok(());
-        }
         _ => {}
     }
 
@@ -135,9 +137,17 @@ async fn async_main(cli: Cli, config_dir: PathBuf) -> Result<()> {
                 server.run().await?;
             }
         }
-        Commands::Stop | Commands::Groups => {
+        Commands::Stop => {
             // Handled above in sync section
             unreachable!()
+        }
+        Commands::Groups { filter } => {
+            let client = crate::client::Client::new(&config_dir);
+            client.list_groups(filter.as_deref()).await?;
+        }
+        Commands::Sync => {
+            let client = crate::client::Client::new(&config_dir);
+            client.sync_contacts().await?;
         }
         Commands::Link { name } => {
             println!("Linking device as '{}'...", name);
