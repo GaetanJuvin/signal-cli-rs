@@ -2,6 +2,7 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -36,7 +37,19 @@ impl Client {
     }
 
     async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-        let stream = UnixStream::connect(&self.socket_path).await
+        self.call_with_timeout(method, params, Duration::from_secs(30)).await
+    }
+
+    async fn call_with_timeout(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        let connect_timeout = Duration::from_secs(5);
+        let stream = tokio::time::timeout(connect_timeout, UnixStream::connect(&self.socket_path))
+            .await
+            .map_err(|_| anyhow!("Connection timeout. Server may be unresponsive."))?
             .map_err(|_| anyhow!("Server not running. Start with: signal-mcp server"))?;
 
         let (reader, mut writer) = stream.into_split();
@@ -53,7 +66,10 @@ impl Client {
 
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+
+        tokio::time::timeout(timeout, reader.read_line(&mut line))
+            .await
+            .map_err(|_| anyhow!("Server response timeout. Try 'signal-mcp stop' and restart the server."))??;
 
         let response: JsonRpcResponse = serde_json::from_str(&line)?;
 
@@ -65,10 +81,15 @@ impl Client {
     }
 
     pub async fn send_message(&self, recipient: &str, message: &str) -> Result<()> {
-        let result = self.call("send_message", serde_json::json!({
-            "recipient": recipient,
-            "message": message
-        })).await?;
+        // Longer timeout for send - includes multi-device sync which can be slow
+        let result = self.call_with_timeout(
+            "send_message",
+            serde_json::json!({
+                "recipient": recipient,
+                "message": message
+            }),
+            Duration::from_secs(120),
+        ).await?;
 
         println!("Sent! Timestamp: {}", result["timestamp"]);
         Ok(())
@@ -137,13 +158,13 @@ impl Client {
     }
 
     pub async fn sync_contacts(&self) -> Result<()> {
+        println!("Requesting contacts sync from primary device...");
         let result = self.call("sync_contacts", serde_json::json!({})).await?;
 
-        if let Some(message) = result["message"].as_str() {
-            println!("{}", message);
-        } else {
-            println!("Sync requested. Contacts will be updated.");
-        }
+        let contacts_count = result["contacts_count"].as_u64().unwrap_or(0);
+        let groups_count = result["groups_count"].as_u64().unwrap_or(0);
+
+        println!("Synced {} contacts and {} groups", contacts_count, groups_count);
         Ok(())
     }
 }
