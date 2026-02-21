@@ -129,7 +129,7 @@ async fn async_main(cli: Cli, config_dir: PathBuf) -> Result<()> {
         Commands::Server { stdio, daemon } => {
             let server = server::Server::new(&config_dir).await?;
             if stdio {
-                server.run_stdio().await?;
+                server.run_stdio(None).await?;
             } else {
                 if !daemon {
                     println!("Starting server...");
