@@ -7,7 +7,6 @@
 
 use anyhow::{Context, Result};
 use daemonize::Daemonize;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -16,8 +15,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+use futures::StreamExt;
+
 use crate::signal::{self, SignalEvent, SignalManager};
-use crate::storage::{Contact, Group, Message, Storage};
+use crate::storage::{Contact, Message, Storage};
 
 /// Global variable to hold the logging guard (keeps logging active)
 static LOGGING_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
@@ -92,7 +93,7 @@ fn setup_daemon_logging(config_dir: &Path) {
         .with_writer(non_blocking)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
+                .add_directive(tracing::Level::DEBUG.into()),
         )
         .with_ansi(false)
         .finish();
@@ -230,6 +231,13 @@ struct ListGroupsParams {
     filter: Option<String>,
 }
 
+/// Result of a contacts sync operation.
+#[derive(Debug, Clone)]
+pub struct SyncResult {
+    pub contacts_count: usize,
+    pub groups_count: usize,
+}
+
 /// Command sent to the Signal manager task.
 enum ManagerCommand {
     SendMessage {
@@ -237,9 +245,75 @@ enum ManagerCommand {
         message: String,
         reply: oneshot::Sender<Result<u64, String>>,
     },
-    SyncContacts {
-        reply: oneshot::Sender<Result<(), String>>,
+    SendGroupMessage {
+        group_id: String,
+        message: String,
+        reply: oneshot::Sender<Result<u64, String>>,
     },
+    SyncContacts {
+        storage: Arc<Mutex<Storage>>,
+        reply: oneshot::Sender<Result<SyncResult, String>>,
+    },
+}
+
+/// Handle the MCP initialize handshake on stdio before the heavy Signal setup.
+///
+/// Claude Code sends `initialize` immediately and expects a fast response.
+/// This handles `initialize` and `notifications/initialized` synchronously
+/// on stdin/stdout so the server is registered before `Server::new()` runs.
+pub async fn mcp_handshake_stdio() -> Result<BufReader<tokio::io::Stdin>> {
+    use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut stdout = stdout();
+    let mut stdin_reader = BufReader::new(stdin());
+    let mut line = String::new();
+
+    // Read lines until we've handled initialize + notifications/initialized
+    let mut initialized = false;
+    let mut notified = false;
+
+    while !initialized || !notified {
+        line.clear();
+        let bytes_read = stdin_reader.read_line(&mut line).await?;
+        if bytes_read == 0 {
+            anyhow::bail!("EOF before MCP handshake completed");
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(trimmed) {
+            match request.method.as_str() {
+                "initialize" => {
+                    let response = rpc_initialize(request.id);
+                    let json = serde_json::to_string(&response)?;
+                    stdout.write_all(json.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                    initialized = true;
+                }
+                "notifications/initialized" => {
+                    // Notification — no response needed
+                    notified = true;
+                }
+                _ => {
+                    // Unexpected method during handshake — respond with error
+                    let response = JsonRpcResponse::error(
+                        request.id,
+                        -32601,
+                        format!("Server initializing, method not available yet: {}", request.method),
+                    );
+                    let json = serde_json::to_string(&response)?;
+                    stdout.write_all(json.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
+                }
+            }
+        }
+    }
+
+    // Return the BufReader so run_stdio can reuse it (avoids losing buffered data)
+    Ok(stdin_reader)
 }
 
 /// The MCP server.
@@ -291,6 +365,49 @@ impl Server {
         // Channel for manager commands (from clients to main loop)
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ManagerCommand>(100);
 
+        // Channel for incoming Signal events from the receive task
+        let (event_tx, mut event_rx) = mpsc::channel::<SignalEvent>(100);
+
+        // Spawn receive loop on a dedicated thread (stream is !Send)
+        // Auto-reconnects with exponential backoff on disconnect.
+        let mut receive_manager = self.manager.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build receive runtime");
+            rt.block_on(async move {
+                let mut backoff_secs = 1u64;
+                loop {
+                    tracing::info!("Starting Signal message receive loop...");
+                    match signal::start_receiving(&mut receive_manager).await {
+                        Ok(mut stream) => {
+                            backoff_secs = 1; // reset on successful connect
+                            loop {
+                                match stream.next().await {
+                                    Some(event) => {
+                                        if event_tx.send(event).await.is_err() {
+                                            tracing::debug!("Event channel closed, stopping receive loop");
+                                            return;
+                                        }
+                                    }
+                                    None => {
+                                        tracing::warn!("Signal receive stream ended, reconnecting in {}s...", backoff_secs);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to start receiving: {}, retrying in {}s...", e, backoff_secs);
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(60);
+                }
+            });
+        });
+
         // Set up SIGTERM handler for graceful shutdown
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
@@ -301,6 +418,13 @@ impl Server {
                 _ = sigterm.recv() => {
                     tracing::info!("Received SIGTERM, shutting down gracefully...");
                     break;
+                }
+
+                // Handle incoming Signal events
+                Some(event) = event_rx.recv() => {
+                    if let Err(e) = self.handle_signal_event(event).await {
+                        tracing::error!("Error handling signal event: {}", e);
+                    }
                 }
 
                 // Handle incoming client connections
@@ -332,9 +456,19 @@ impl Server {
                             let result = signal::send_message(&mut self.manager, &recipient_uuid, &message).await;
                             let _ = reply.send(result.map_err(|e| e.to_string()));
                         }
-                        ManagerCommand::SyncContacts { reply } => {
-                            let result = signal::request_contacts_sync(&mut self.manager).await;
+                        ManagerCommand::SendGroupMessage { group_id, message, reply } => {
+                            let result = signal::send_group_message(&mut self.manager, &group_id, &message).await;
                             let _ = reply.send(result.map_err(|e| e.to_string()));
+                        }
+                        ManagerCommand::SyncContacts { storage, reply } => {
+                            tracing::info!("Starting contacts sync...");
+                            let result = signal::request_contacts_sync(&mut self.manager, &storage).await;
+                            if let Ok((c, g)) = &result {
+                                tracing::info!("Sync completed: {} contacts, {} groups", c, g);
+                            }
+                            let _ = reply.send(result.map(|(contacts_count, groups_count)| {
+                                SyncResult { contacts_count, groups_count }
+                            }).map_err(|e| e.to_string()));
                         }
                     }
                 }
@@ -352,18 +486,68 @@ impl Server {
     /// This reads JSON-RPC requests from stdin and writes responses to stdout,
     /// instead of using a Unix socket. This is the standard transport for MCP
     /// (Model Context Protocol) clients like Claude.
-    pub async fn run_stdio(mut self) -> Result<()> {
+    pub async fn run_stdio(mut self, stdin_reader: Option<BufReader<tokio::io::Stdin>>) -> Result<()> {
         use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let mut stdout = stdout();
-        let mut stdin_reader = BufReader::new(stdin());
+        let mut stdin_reader = stdin_reader.unwrap_or_else(|| BufReader::new(stdin()));
         let mut line = String::new();
 
         // Channel for manager commands (from request handler to main loop)
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ManagerCommand>(100);
 
+        // Channel for incoming Signal events from the receive task
+        let (event_tx, mut event_rx) = mpsc::channel::<SignalEvent>(100);
+
+        // Spawn receive loop on a dedicated thread (stream is !Send)
+        // Auto-reconnects with exponential backoff on disconnect.
+        let mut receive_manager = self.manager.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to build receive runtime");
+            rt.block_on(async move {
+                let mut backoff_secs = 1u64;
+                loop {
+                    tracing::info!("Starting Signal message receive loop (stdio)...");
+                    match signal::start_receiving(&mut receive_manager).await {
+                        Ok(mut stream) => {
+                            backoff_secs = 1;
+                            loop {
+                                match stream.next().await {
+                                    Some(event) => {
+                                        if event_tx.send(event).await.is_err() {
+                                            tracing::debug!("Event channel closed, stopping receive loop");
+                                            return;
+                                        }
+                                    }
+                                    None => {
+                                        tracing::warn!("Signal receive stream ended, reconnecting in {}s...", backoff_secs);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to start receiving: {}, retrying in {}s...", e, backoff_secs);
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(60);
+                }
+            });
+        });
+
         loop {
             tokio::select! {
+                // Handle incoming Signal events
+                Some(event) = event_rx.recv() => {
+                    if let Err(e) = self.handle_signal_event(event).await {
+                        tracing::error!("Error handling signal event: {}", e);
+                    }
+                }
+
                 // Handle stdin input
                 result = stdin_reader.read_line(&mut line) => {
                     match result {
@@ -374,11 +558,19 @@ impl Server {
                         Ok(_) => {
                             let trimmed = line.trim();
                             if !trimmed.is_empty() {
-                                let response = match serde_json::from_str::<JsonRpcRequest>(trimmed) {
+                                match serde_json::from_str::<JsonRpcRequest>(trimmed) {
                                     Ok(request) => {
-                                        // Handle send_message specially since it needs the manager
-                                        if request.method == "send_message" {
-                                            self.handle_send_message_request(request, &cmd_tx).await
+                                        // Notifications have no id — don't send a response
+                                        let is_notification = request.id.is_none();
+
+                                        // In stdio mode, handle manager commands
+                                        // directly to avoid deadlock — the channel
+                                        // consumer is in this same select loop, so
+                                        // sending a command and awaiting the reply
+                                        // would block forever.
+                                        let needs_manager = Self::request_needs_manager(&request);
+                                        let response = if needs_manager {
+                                            self.handle_manager_request_direct(request).await
                                         } else {
                                             handle_request(
                                                 request,
@@ -386,19 +578,27 @@ impl Server {
                                                 &cmd_tx,
                                                 &self.account_uuid,
                                             ).await
+                                        };
+
+                                        if !is_notification {
+                                            let response_json = serde_json::to_string(&response)?;
+                                            stdout.write_all(response_json.as_bytes()).await?;
+                                            stdout.write_all(b"\n").await?;
+                                            stdout.flush().await?;
                                         }
                                     }
-                                    Err(e) => JsonRpcResponse::error(
-                                        None,
-                                        -32700,
-                                        format!("Parse error: {}", e),
-                                    ),
+                                    Err(e) => {
+                                        let response = JsonRpcResponse::error(
+                                            None,
+                                            -32700,
+                                            format!("Parse error: {}", e),
+                                        );
+                                        let response_json = serde_json::to_string(&response)?;
+                                        stdout.write_all(response_json.as_bytes()).await?;
+                                        stdout.write_all(b"\n").await?;
+                                        stdout.flush().await?;
+                                    }
                                 };
-
-                                let response_json = serde_json::to_string(&response)?;
-                                stdout.write_all(response_json.as_bytes()).await?;
-                                stdout.write_all(b"\n").await?;
-                                stdout.flush().await?;
                             }
                             line.clear();
                         }
@@ -416,9 +616,15 @@ impl Server {
                             let result = signal::send_message(&mut self.manager, &recipient_uuid, &message).await;
                             let _ = reply.send(result.map_err(|e| e.to_string()));
                         }
-                        ManagerCommand::SyncContacts { reply } => {
-                            let result = signal::request_contacts_sync(&mut self.manager).await;
+                        ManagerCommand::SendGroupMessage { group_id, message, reply } => {
+                            let result = signal::send_group_message(&mut self.manager, &group_id, &message).await;
                             let _ = reply.send(result.map_err(|e| e.to_string()));
+                        }
+                        ManagerCommand::SyncContacts { storage, reply } => {
+                            let result = signal::request_contacts_sync(&mut self.manager, &storage).await;
+                            let _ = reply.send(result.map(|(contacts_count, groups_count)| {
+                                SyncResult { contacts_count, groups_count }
+                            }).map_err(|e| e.to_string()));
                         }
                     }
                 }
@@ -428,13 +634,210 @@ impl Server {
         Ok(())
     }
 
-    /// Handle a send_message request directly (for stdio mode).
-    async fn handle_send_message_request(
-        &self,
+    /// Check if a request needs the Signal manager (and would deadlock via channel).
+    fn request_needs_manager(request: &JsonRpcRequest) -> bool {
+        if request.method == "send_message" || request.method == "sync_contacts" {
+            return true;
+        }
+        if request.method == "tools/call" {
+            if let Some(params) = &request.params {
+                if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+                    return matches!(name, "send_message" | "sync_contacts");
+                }
+            }
+        }
+        false
+    }
+
+    /// Handle requests that need the Signal manager directly (for stdio mode).
+    ///
+    /// This bypasses the channel to avoid deadlock — in stdio mode the channel
+    /// consumer lives in the same select loop as the stdin handler, so sending
+    /// a command and awaiting its reply would block forever.
+    async fn handle_manager_request_direct(
+        &mut self,
         request: JsonRpcRequest,
-        cmd_tx: &mpsc::Sender<ManagerCommand>,
     ) -> JsonRpcResponse {
-        handle_request(request, &self.storage, cmd_tx, &self.account_uuid).await
+        // Extract the actual tool name and arguments
+        let (tool_name, arguments, request_id) = if request.method == "tools/call" {
+            // MCP tools/call — extract name and arguments from params
+            let params = match &request.params {
+                Some(p) => p.clone(),
+                None => {
+                    return JsonRpcResponse::error(
+                        request.id,
+                        -32602,
+                        "Missing params".to_string(),
+                    )
+                }
+            };
+            let name = match params.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        request.id,
+                        -32602,
+                        "Missing tool name".to_string(),
+                    )
+                }
+            };
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            (name, args, request.id)
+        } else {
+            // Direct RPC call (e.g. method="send_message")
+            let args = request.params.unwrap_or(serde_json::json!({}));
+            (request.method, args, request.id)
+        };
+
+        tracing::info!("handle_manager_request_direct: {}", tool_name);
+
+        match tool_name.as_str() {
+            "send_message" => {
+                self.send_message_direct(request_id, arguments).await
+            }
+            "sync_contacts" => {
+                self.sync_contacts_direct(request_id).await
+            }
+            _ => JsonRpcResponse::error(
+                request_id,
+                -32601,
+                format!("Unknown manager method: {}", tool_name),
+            ),
+        }
+    }
+
+    /// Send a message directly using the manager (no channel).
+    async fn send_message_direct(
+        &mut self,
+        id: Option<serde_json::Value>,
+        arguments: serde_json::Value,
+    ) -> JsonRpcResponse {
+        let params: SendMessageParams = match serde_json::from_value(arguments) {
+            Ok(params) => params,
+            Err(e) => {
+                return JsonRpcResponse::error(id, -32602, format!("Invalid params: {}", e))
+            }
+        };
+
+        // Resolve recipient
+        let resolved = {
+            let storage = self.storage.lock().await;
+            match storage.resolve_recipient(&params.recipient) {
+                Ok(Some(uuid)) => ResolvedRecipient::Contact(uuid),
+                Ok(None) => match storage.find_group(&params.recipient) {
+                    Ok(Some(group_id)) => ResolvedRecipient::Group(group_id),
+                    Ok(None) => {
+                        return JsonRpcResponse::error(
+                            id,
+                            -32000,
+                            format!("Could not resolve recipient: {}", params.recipient),
+                        )
+                    }
+                    Err(e) => {
+                        return JsonRpcResponse::error(
+                            id,
+                            -32000,
+                            format!("Error resolving recipient: {}", e),
+                        )
+                    }
+                },
+                Err(e) => {
+                    return JsonRpcResponse::error(
+                        id,
+                        -32000,
+                        format!("Error resolving recipient: {}", e),
+                    )
+                }
+            }
+        };
+
+        // Send directly using the manager
+        let (timestamp, recipient_id, is_group) = match &resolved {
+            ResolvedRecipient::Contact(uuid) => {
+                match signal::send_message(&mut self.manager, uuid, &params.message).await {
+                    Ok(ts) => (ts, uuid.clone(), false),
+                    Err(e) => {
+                        return JsonRpcResponse::error(
+                            id,
+                            -32000,
+                            format!("Failed to send message: {}", e),
+                        )
+                    }
+                }
+            }
+            ResolvedRecipient::Group(group_id) => {
+                match signal::send_group_message(&mut self.manager, group_id, &params.message).await
+                {
+                    Ok(ts) => (ts, group_id.clone(), true),
+                    Err(e) => {
+                        return JsonRpcResponse::error(
+                            id,
+                            -32000,
+                            format!("Failed to send group message: {}", e),
+                        )
+                    }
+                }
+            }
+        };
+
+        // Store the outgoing message
+        if !is_group {
+            let storage = self.storage.lock().await;
+            if let Err(e) = storage.insert_message(&Message {
+                id: 0,
+                contact_uuid: recipient_id.clone(),
+                direction: "out".to_string(),
+                body: params.message.clone(),
+                timestamp: timestamp as i64,
+            }) {
+                tracing::warn!("Failed to store outgoing message: {}", e);
+            }
+        }
+
+        // For tools/call, wrap in MCP content array format
+        let result = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::json!({
+                    "success": true,
+                    "timestamp": timestamp,
+                    "recipient": recipient_id,
+                }).to_string()
+            }]
+        });
+
+        JsonRpcResponse::success(id, result)
+    }
+
+    /// Sync contacts directly using the manager (no channel).
+    async fn sync_contacts_direct(
+        &mut self,
+        id: Option<serde_json::Value>,
+    ) -> JsonRpcResponse {
+        let storage = self.storage.clone();
+        match signal::request_contacts_sync(&mut self.manager, &storage).await {
+            Ok((contacts_count, groups_count)) => {
+                let result = serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::json!({
+                            "success": true,
+                            "contacts_synced": contacts_count,
+                            "groups_synced": groups_count,
+                        }).to_string()
+                    }]
+                });
+                JsonRpcResponse::success(id, result)
+            }
+            Err(e) => JsonRpcResponse::error(
+                id,
+                -32000,
+                format!("Failed to sync contacts: {}", e),
+            ),
+        }
     }
 
     /// Handle Signal events by storing them in the database.
@@ -542,10 +945,12 @@ async fn handle_request(
         "send_message" => rpc_send_message(request.id, request.params, storage, cmd_tx).await,
         "list_contacts" => rpc_list_contacts(request.id, request.params, storage).await,
         "list_groups" => rpc_list_groups(request.id, request.params, storage).await,
-        "sync_contacts" => rpc_sync_contacts(request.id, cmd_tx).await,
+        "sync_contacts" => rpc_sync_contacts(request.id, storage, cmd_tx).await,
         "get_messages" => rpc_get_messages(request.id, request.params, storage).await,
         "get_conversations" => rpc_get_conversations(request.id, request.params, storage).await,
         "get_status" => rpc_get_status(request.id, account_uuid),
+        "initialize" => rpc_initialize(request.id),
+        "notifications/initialized" => JsonRpcResponse::success(request.id, serde_json::json!({})),
         "tools/list" => rpc_tools_list(request.id),
         "tools/call" => rpc_tools_call(request.id, request.params, storage, cmd_tx, account_uuid).await,
         _ => JsonRpcResponse::error(
@@ -554,6 +959,12 @@ async fn handle_request(
             format!("Method not found: {}", request.method),
         ),
     }
+}
+
+/// Resolved recipient - either a contact UUID or a group ID.
+enum ResolvedRecipient {
+    Contact(String),
+    Group(String),
 }
 
 /// RPC: send_message - Send a message via Signal.
@@ -573,17 +984,41 @@ async fn rpc_send_message(
         None => return JsonRpcResponse::error(id, -32602, "Missing params".to_string()),
     };
 
-    // Resolve recipient to UUID
-    let recipient_uuid = {
+    // Resolve recipient - try contact first, then group
+    let resolved = {
         let storage = storage.lock().await;
+
+        // Try to resolve as contact (UUID, phone, name)
+        tracing::debug!("Resolving recipient: {}", params.recipient);
         match storage.resolve_recipient(&params.recipient) {
-            Ok(Some(uuid)) => uuid,
+            Ok(Some(uuid)) => {
+                tracing::debug!("Resolved as contact: {}", uuid);
+                ResolvedRecipient::Contact(uuid)
+            }
             Ok(None) => {
-                return JsonRpcResponse::error(
-                    id,
-                    -32000,
-                    format!("Could not resolve recipient: {}", params.recipient),
-                )
+                tracing::debug!("Not a contact, trying group...");
+                // Try to resolve as group (ID or name)
+                match storage.find_group(&params.recipient) {
+                    Ok(Some(group_id)) => {
+                        tracing::debug!("Resolved as group: {}", group_id);
+                        ResolvedRecipient::Group(group_id)
+                    }
+                    Ok(None) => {
+                        tracing::debug!("Not found as contact or group");
+                        return JsonRpcResponse::error(
+                            id,
+                            -32000,
+                            format!("Could not resolve recipient: {}", params.recipient),
+                        )
+                    }
+                    Err(e) => {
+                        return JsonRpcResponse::error(
+                            id,
+                            -32000,
+                            format!("Error resolving recipient: {}", e),
+                        )
+                    }
+                }
             }
             Err(e) => {
                 return JsonRpcResponse::error(
@@ -595,12 +1030,27 @@ async fn rpc_send_message(
         }
     };
 
-    // Send command to manager task
+    // Send command to manager task based on recipient type
     let (reply_tx, reply_rx) = oneshot::channel();
-    let cmd = ManagerCommand::SendMessage {
-        recipient_uuid: recipient_uuid.clone(),
-        message: params.message.clone(),
-        reply: reply_tx,
+    let (cmd, recipient_id, is_group) = match &resolved {
+        ResolvedRecipient::Contact(uuid) => (
+            ManagerCommand::SendMessage {
+                recipient_uuid: uuid.clone(),
+                message: params.message.clone(),
+                reply: reply_tx,
+            },
+            uuid.clone(),
+            false,
+        ),
+        ResolvedRecipient::Group(group_id) => (
+            ManagerCommand::SendGroupMessage {
+                group_id: group_id.clone(),
+                message: params.message.clone(),
+                reply: reply_tx,
+            },
+            group_id.clone(),
+            true,
+        ),
     };
 
     if cmd_tx.send(cmd).await.is_err() {
@@ -617,12 +1067,12 @@ async fn rpc_send_message(
         }
     };
 
-    // Store the outgoing message
-    {
+    // Store the outgoing message (only for contacts, not groups for now)
+    if !is_group {
         let storage = storage.lock().await;
         if let Err(e) = storage.insert_message(&Message {
             id: 0,
-            contact_uuid: recipient_uuid.clone(),
+            contact_uuid: recipient_id.clone(),
             direction: "out".to_string(),
             body: params.message,
             timestamp: timestamp as i64,
@@ -631,14 +1081,18 @@ async fn rpc_send_message(
         }
     }
 
-    JsonRpcResponse::success(
-        id,
-        serde_json::json!({
-            "success": true,
-            "timestamp": timestamp,
-            "recipient_uuid": recipient_uuid,
-        }),
-    )
+    let mut response = serde_json::json!({
+        "success": true,
+        "timestamp": timestamp,
+    });
+
+    if is_group {
+        response["group_id"] = serde_json::json!(recipient_id);
+    } else {
+        response["recipient_uuid"] = serde_json::json!(recipient_id);
+    }
+
+    JsonRpcResponse::success(id, response)
 }
 
 /// RPC: list_contacts - List contacts from storage.
@@ -678,21 +1132,27 @@ async fn rpc_list_groups(
 /// RPC: sync_contacts - Request contacts sync from primary device.
 async fn rpc_sync_contacts(
     id: Option<serde_json::Value>,
+    storage: &Arc<Mutex<Storage>>,
     cmd_tx: &mpsc::Sender<ManagerCommand>,
 ) -> JsonRpcResponse {
     let (reply_tx, reply_rx) = oneshot::channel();
-    let cmd = ManagerCommand::SyncContacts { reply: reply_tx };
+    let cmd = ManagerCommand::SyncContacts {
+        storage: Arc::clone(storage),
+        reply: reply_tx,
+    };
 
     if cmd_tx.send(cmd).await.is_err() {
         return JsonRpcResponse::error(id, -32000, "Server shutting down".to_string());
     }
 
     match reply_rx.await {
-        Ok(Ok(())) => JsonRpcResponse::success(
+        Ok(Ok(result)) => JsonRpcResponse::success(
             id,
             serde_json::json!({
                 "success": true,
-                "message": "Sync requested. Contacts will be updated."
+                "contacts_count": result.contacts_count,
+                "groups_count": result.groups_count,
+                "message": format!("Synced {} contacts and {} groups", result.contacts_count, result.groups_count)
             }),
         ),
         Ok(Err(e)) => {
@@ -780,6 +1240,15 @@ async fn rpc_get_conversations(
         Ok(conversations) => JsonRpcResponse::success(id, serde_json::to_value(conversations).unwrap()),
         Err(e) => JsonRpcResponse::error(id, -32000, format!("Failed to get conversations: {}", e)),
     }
+}
+
+/// RPC: initialize - MCP protocol handshake.
+fn rpc_initialize(id: Option<serde_json::Value>) -> JsonRpcResponse {
+    JsonRpcResponse::success(id, serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": { "tools": {} },
+        "serverInfo": { "name": "signal-mcp", "version": "0.1.0" }
+    }))
 }
 
 /// RPC: tools/list - List available MCP tools.
@@ -966,7 +1435,7 @@ async fn rpc_tools_call(
             }
         }
         "sync_contacts" => {
-            let response = rpc_sync_contacts(None, cmd_tx).await;
+            let response = rpc_sync_contacts(None, storage, cmd_tx).await;
             match response.result {
                 Some(r) => r,
                 None => return JsonRpcResponse::error(

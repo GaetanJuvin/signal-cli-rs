@@ -31,6 +31,7 @@ pub struct Conversation {
     pub contact: Contact,
     pub last_message: String,
     pub last_timestamp: i64,
+    pub last_direction: String,
     pub unread_count: i64,
 }
 
@@ -234,9 +235,33 @@ impl Storage {
         }
     }
 
+    /// Find a group by ID or name.
+    pub fn find_group(&self, query: &str) -> Result<Option<String>> {
+        // Try exact ID match first
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM groups WHERE id = ?1"
+        )?;
+        if let Ok(id) = stmt.query_row([query], |row| row.get::<_, String>(0)) {
+            tracing::debug!("Found group by ID: {}", id);
+            return Ok(Some(id));
+        }
+
+        // Try name match (case-insensitive)
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM groups WHERE LOWER(name) = LOWER(?1)"
+        )?;
+        if let Ok(id) = stmt.query_row([query], |row| row.get::<_, String>(0)) {
+            tracing::debug!("Found group by name: {}", id);
+            return Ok(Some(id));
+        }
+
+        tracing::debug!("Group not found for query: {}", query);
+        Ok(None)
+    }
+
     pub fn get_conversations(&self, limit: i64) -> Result<Vec<Conversation>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.uuid, c.phone, c.name, m.body, m.timestamp,
+            "SELECT c.uuid, c.phone, c.name, m.body, m.timestamp, m.direction,
                     (SELECT COUNT(*) FROM messages m2
                      WHERE m2.contact_uuid = c.uuid AND m2.direction = 'in')
              FROM contacts c
@@ -257,7 +282,8 @@ impl Storage {
                 },
                 last_message: row.get(3)?,
                 last_timestamp: row.get(4)?,
-                unread_count: row.get(5)?,
+                last_direction: row.get(5)?,
+                unread_count: row.get(6)?,
             })
         })?;
 

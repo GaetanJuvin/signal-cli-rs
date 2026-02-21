@@ -6,18 +6,25 @@
 use anyhow::{anyhow, Context, Result};
 use futures::{channel::oneshot, future, StreamExt};
 use presage::libsignal_service::configuration::SignalServers;
-use presage::libsignal_service::content::{Content, ContentBody, DataMessage};
+use presage::libsignal_service::content::{
+    sync_message, Content, ContentBody, DataMessage, SyncMessage,
+};
+use presage::libsignal_service::prelude::phonenumber::PhoneNumber;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::protocol::ServiceId;
-use presage::manager::Registered;
+use presage::manager::{ConfirmationData, Registered, RegistrationOptions};
 use presage::model::messages::Received;
-use presage::store::StateStore;
+use presage::store::{ContentsStore, StateStore};
 use presage::Manager;
 use presage_store_sqlite::{OnNewIdentity, SqliteStore};
 use std::path::Path;
+use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use url::Url;
+
+use crate::storage::{Contact, Group, Storage};
 
 /// Type alias for a registered Signal manager using SQLite storage.
 pub type SignalManager = Manager<SqliteStore, Registered>;
@@ -105,6 +112,61 @@ pub async fn link_device(
     manager_result.map_err(|e| anyhow!("Failed to link device: {}", e))
 }
 
+/// Register a new primary device with a phone number.
+///
+/// This is step 1 of registration: it sends an SMS verification code
+/// to the given phone number and returns serializable confirmation data
+/// that must be passed to `confirm_registration` with the code.
+pub async fn request_registration(
+    store_path: &Path,
+    phone_number: &str,
+    captcha: Option<&str>,
+    use_voice: bool,
+) -> Result<ConfirmationData> {
+    let phone = PhoneNumber::from_str(phone_number)
+        .map_err(|e| anyhow!("Invalid phone number '{}': {}", phone_number, e))?;
+
+    let store = open_store(store_path).await?;
+
+    let manager = Manager::register(
+        store,
+        RegistrationOptions {
+            signal_servers: SignalServers::Production,
+            phone_number: phone,
+            use_voice_call: use_voice,
+            captcha,
+            force: true,
+        },
+    )
+    .await
+    .map_err(|e| anyhow!("Registration failed: {}", e))?;
+
+    Ok(manager.confirmation_data())
+}
+
+/// Confirm registration with the verification code received via SMS/voice.
+///
+/// This is step 2 of registration: it takes the confirmation data from
+/// `request_registration` and the verification code, and completes the
+/// registration process.
+pub async fn confirm_registration(
+    store_path: &Path,
+    confirmation_data: ConfirmationData,
+    code: &str,
+) -> Result<SignalManager> {
+    let store = open_store(store_path).await?;
+
+    let manager = Manager::from_confirmation_data(store, confirmation_data)
+        .map_err(|e| anyhow!("Failed to restore confirmation state: {}", e))?;
+
+    let registered = manager
+        .confirm_verification_code(code)
+        .await
+        .map_err(|e| anyhow!("Verification failed: {}", e))?;
+
+    Ok(registered)
+}
+
 /// Load an already-registered manager from the store.
 ///
 /// # Arguments
@@ -179,33 +241,106 @@ pub async fn send_message(
         ..Default::default()
     };
 
-    manager
-        .send_message(ServiceId::Aci(uuid.into()), data_message, timestamp)
-        .await
-        .map_err(|e| anyhow!("Failed to send message: {}", e))?;
+    tracing::info!("Sending message to {}...", recipient_uuid);
+
+    // Timeout for send operation - 15s to avoid blocking MCP clients
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        manager.send_message(ServiceId::Aci(uuid.into()), data_message, timestamp),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            tracing::info!("Message sent successfully to {}", recipient_uuid);
+            Ok(timestamp)
+        }
+        Ok(Err(e)) => {
+            tracing::error!("Failed to send message to {}: {}", recipient_uuid, e);
+            Err(anyhow!("Failed to send message: {}", e))
+        }
+        Err(_) => {
+            // Timeout - message was likely sent but sync failed
+            tracing::warn!("Send message timed out after 15s to {} — message may have been delivered", recipient_uuid);
+            Ok(timestamp)
+        }
+    }
+}
+
+/// Send a text message to a group identified by its base64-encoded master key.
+///
+/// # Arguments
+///
+/// * `manager` - The registered Signal manager
+/// * `group_id` - Base64-encoded group master key
+/// * `message` - The message text to send
+///
+/// # Returns
+///
+/// The timestamp of the sent message.
+pub async fn send_group_message(
+    manager: &mut SignalManager,
+    group_id: &str,
+    message: &str,
+) -> Result<u64> {
+    // Decode the base64 group ID to get the master key bytes
+    let master_key_bytes = base64_decode(group_id)
+        .with_context(|| format!("Invalid group ID (not valid base64): {}", group_id))?;
+
+    if master_key_bytes.len() != 32 {
+        return Err(anyhow!("Invalid group master key length: expected 32 bytes, got {}", master_key_bytes.len()));
+    }
+
+    let mut master_key = [0u8; 32];
+    master_key.copy_from_slice(&master_key_bytes);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis() as u64;
+
+    let data_message = DataMessage {
+        body: Some(message.to_string()),
+        timestamp: Some(timestamp),
+        ..Default::default()
+    };
+
+    // Timeout for send operation - group sends can be slow with many recipients
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        manager.send_message_to_group(&master_key, data_message, timestamp),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(anyhow!("Failed to send group message: {}", e)),
+        Err(_) => {
+            tracing::warn!("Group message send timed out, but message was likely delivered to some recipients");
+        }
+    }
 
     Ok(timestamp)
 }
 
-/// Start receiving messages - returns the message stream.
+/// Start receiving messages - returns a boxed message stream.
 ///
-/// The caller should poll this stream in their event loop.
+/// The stream is heap-allocated (`Box::pin`) because presage's deeply nested
+/// future types are too large for the stack.
 pub async fn start_receiving(
     manager: &mut SignalManager,
-) -> Result<impl futures::Stream<Item = SignalEvent> + '_> {
+) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = SignalEvent> + '_>>> {
     let messages = manager
         .receive_messages()
         .await
         .map_err(|e| anyhow!("Failed to start receiving messages: {}", e))?;
 
-    Ok(messages.filter_map(|received| {
+    Ok(Box::pin(messages.filter_map(|received| {
         let event = match received {
             Received::QueueEmpty => Some(SignalEvent::QueueEmpty),
             Received::Contacts => Some(SignalEvent::ContactsSync),
             Received::Content(content) => content_to_event(&content),
         };
         future::ready(event)
-    }))
+    })))
 }
 
 /// Convert a Content message to a SignalEvent if it contains a text message.
@@ -221,50 +356,219 @@ fn content_to_event(content: &Content) -> Option<SignalEvent> {
             body: text.clone(),
             timestamp,
         }),
-        ContentBody::SynchronizeMessage(sync_msg) => {
-            // Handle sent messages (from another device)
-            if let Some(sent) = &sync_msg.sent {
-                if let Some(DataMessage {
-                    body: Some(text), ..
-                }) = &sent.message
-                {
-                    return Some(SignalEvent::Message {
-                        sender_uuid,
-                        body: text.clone(),
-                        timestamp: sent.timestamp.unwrap_or(timestamp),
-                    });
-                }
-            }
+        // "Note to Self" — a sync message where we sent a message to our own account
+        ContentBody::SynchronizeMessage(SyncMessage {
+            sent:
+                Some(sync_message::Sent {
+                    destination_service_id: Some(dest_uuid),
+                    message:
+                        Some(DataMessage {
+                            body: Some(text), ..
+                        }),
+                    ..
+                }),
+            ..
+        }) if dest_uuid == &sender_uuid => Some(SignalEvent::Message {
+            sender_uuid,
+            body: text.clone(),
+            timestamp,
+        }),
+        ContentBody::SynchronizeMessage(_) => {
+            // Skip other sync messages — these are our own outgoing messages
+            // echoed back from another device.
             None
         }
         _ => None,
     }
 }
 
-/// Request contacts sync from the primary device.
+/// Request contacts sync from the primary device and wait for them to arrive.
 ///
-/// This is useful for secondary devices to get the contact list.
-/// Note: This sends the request but the response requires the message receive loop.
+/// This function:
+/// 1. Sends a sync request to the primary device
+/// 2. Starts receiving messages
+/// 3. Waits for the Contacts signal (or timeout after 30 seconds)
+/// 4. Reads contacts from presage's store and saves them to our storage
+/// 5. Also reads groups from presage's store
 ///
 /// # Arguments
 ///
 /// * `manager` - The registered Signal manager
-pub async fn request_contacts_sync(manager: &mut SignalManager) -> Result<()> {
-    // Add a timeout since this can hang if no response is received
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+/// * `storage` - Our storage to save contacts/groups to
+///
+/// # Returns
+///
+/// A tuple of (contacts_count, groups_count)
+pub async fn request_contacts_sync(
+    manager: &mut SignalManager,
+    storage: &Arc<Mutex<Storage>>,
+) -> Result<(usize, usize)> {
+    // Try to send sync request to primary device (with timeout)
+    // If it times out, we'll still read whatever is in the store
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
         manager.request_contacts()
-    ).await;
-
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(anyhow!("Failed to request contacts: {}", e)),
+    ).await {
+        Ok(Ok(())) => {
+            tracing::debug!("Sync request sent to primary device");
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("Failed to request contacts from primary: {}", e);
+        }
         Err(_) => {
-            // Timeout - the request was likely sent but we can't confirm
-            // This is expected since we don't have an active receive loop
-            Ok(())
+            tracing::debug!("Sync request timed out - reading from store");
         }
     }
+
+    // Read contacts directly from presage's store
+
+    // Now read contacts and groups from presage's store and save to our storage
+    let mut contacts_count = 0;
+    let mut groups_count = 0;
+
+    // Get contacts from presage store
+    let presage_contacts = manager.store().contacts().await
+        .map_err(|e| anyhow!("Failed to get contacts from store: {}", e))?;
+
+    {
+        let storage = storage.lock().await;
+
+        for contact_result in presage_contacts {
+            match contact_result {
+                Ok(presage_contact) => {
+                    let contact = Contact {
+                        uuid: presage_contact.uuid.to_string(),
+                        phone: presage_contact.phone_number.map(|p| p.to_string()),
+                        name: if presage_contact.name.is_empty() {
+                            None
+                        } else {
+                            Some(presage_contact.name.clone())
+                        },
+                    };
+
+                    if let Err(e) = storage.upsert_contact(&contact) {
+                        tracing::warn!("Failed to save contact {}: {}", contact.uuid, e);
+                    } else {
+                        contacts_count += 1;
+                        tracing::debug!("Saved contact: {} ({:?})", contact.uuid, contact.name);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Error reading contact: {}", e);
+                }
+            }
+        }
+    }
+
+    // Get groups from presage store
+    let presage_groups = manager.store().groups().await
+        .map_err(|e| anyhow!("Failed to get groups from store: {}", e))?;
+
+    {
+        let storage = storage.lock().await;
+
+        for group_result in presage_groups {
+            match group_result {
+                Ok((master_key_bytes, presage_group)) => {
+                    // Convert master key bytes to base64 for ID
+                    let group_id = base64_encode(&master_key_bytes);
+
+                    let group = Group {
+                        id: group_id.clone(),
+                        name: if presage_group.title.is_empty() {
+                            None
+                        } else {
+                            Some(presage_group.title.clone())
+                        },
+                        members_count: presage_group.members.len(),
+                    };
+
+                    if let Err(e) = storage.upsert_group(&group) {
+                        tracing::warn!("Failed to save group {}: {}", group_id, e);
+                    } else {
+                        groups_count += 1;
+                        tracing::debug!("Saved group: {} ({:?})", group_id, group.name);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Error reading group: {}", e);
+                }
+            }
+        }
+    }
+
+    Ok((contacts_count, groups_count))
+}
+
+/// Simple base64 encoding for group IDs
+fn base64_encode(data: &[u8]) -> String {
+    let mut result = String::new();
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+
+        let n = (b0 << 16) | (b1 << 8) | b2;
+
+        result.push(CHARS[(n >> 18) & 0x3F] as char);
+        result.push(CHARS[(n >> 12) & 0x3F] as char);
+
+        if chunk.len() > 1 {
+            result.push(CHARS[(n >> 6) & 0x3F] as char);
+        } else {
+            result.push('=');
+        }
+
+        if chunk.len() > 2 {
+            result.push(CHARS[n & 0x3F] as char);
+        } else {
+            result.push('=');
+        }
+    }
+
+    result
+}
+
+/// Simple base64 decoding for group IDs
+fn base64_decode(data: &str) -> Result<Vec<u8>> {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    fn char_to_val(c: char) -> Option<u8> {
+        CHARS.iter().position(|&x| x == c as u8).map(|p| p as u8)
+    }
+
+    let data = data.trim_end_matches('=');
+    let mut result = Vec::new();
+
+    let chars: Vec<char> = data.chars().collect();
+    for chunk in chars.chunks(4) {
+        let vals: Vec<u8> = chunk.iter()
+            .filter_map(|&c| char_to_val(c))
+            .collect();
+
+        if vals.len() < 2 {
+            return Err(anyhow!("Invalid base64 string"));
+        }
+
+        let n = match vals.len() {
+            2 => ((vals[0] as u32) << 18) | ((vals[1] as u32) << 12),
+            3 => ((vals[0] as u32) << 18) | ((vals[1] as u32) << 12) | ((vals[2] as u32) << 6),
+            4 => ((vals[0] as u32) << 18) | ((vals[1] as u32) << 12) | ((vals[2] as u32) << 6) | (vals[3] as u32),
+            _ => return Err(anyhow!("Invalid base64 string")),
+        };
+
+        result.push(((n >> 16) & 0xFF) as u8);
+        if vals.len() > 2 {
+            result.push(((n >> 8) & 0xFF) as u8);
+        }
+        if vals.len() > 3 {
+            result.push((n & 0xFF) as u8);
+        }
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
